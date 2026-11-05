@@ -1,0 +1,100 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Bingo Real-Money Platform — full local stack (ADR-27 infrastructure baseline)
+#
+#   docker compose -f infra/compose/docker-compose.yml up -d
+#
+# Brings up everything the SRS names for the demo phase:
+#   · PostgreSQL 16  — system of record (ADR-24), replaced SQLite in staging+.
+#   · Redis 7        — streams/fan-out/short cache ONLY, never funds (AP-04).
+#   · NATS JetStream — event bus behind IEventBus (ADR-19/28); Kafka-compatible
+#                      swap deferred to Phase 2 by design.
+#   · web            — Next.js app (gateway + engine + consoles in this build).
+#   · room-events    — socket.io fan-out hub (the SignalR gateway role).
+#   · prometheus     — scrape of both services' /metrics (ADR-29).
+# Application-level tenant scoping always on; PG RLS adds its second layer
+# (prisma/rls-postgres.sql is applied by the migrator service at startup).
+# ═══════════════════════════════════════════════════════════════════════════
+name: bingo-platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bingo
+      POSTGRES_PASSWORD: bingo_dev_password        # dev only — envs inject secrets
+      POSTGRES_DB: bingo
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=256MB"]
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../../prisma/rls-postgres.sql:/docker-entrypoint-initdb.d/40-rls.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bingo -d bingo"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    # noeviction: a silent evict of a card-fingerprint set or room stream is a
+    # correctness risk (AP-04 boundary); we prefer loud failures over loss.
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-m", "8222"]
+    ports: ["4222:4222", "8222:8222"]   # client + monitoring (/jsz streams lag)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrator:
+    build: { context: ../.., dockerfile: infra/docker/web.Dockerfile, target: migrator }
+    environment: &appenv
+      DATABASE_URL: postgresql://bingo:bingo_dev_password@postgres:5432/bingo
+      REDIS_URL: redis://redis:6379
+      NATS_URL: nats://nats:4222
+      APP_SECRET: ${APP_SECRET:-dev-only-secret-change-me-32bytes-minimum!!}
+    command: ["sh", "-c", "npx prisma migrate deploy && psql $$DATABASE_URL -f prisma/rls-postgres.sql"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  web:
+    build: { context: ../.., dockerfile: infra/docker/web.Dockerfile }
+    environment: *appenv
+    ports: ["3000:3000"]
+    depends_on:
+      migrator: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      nats: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/v1/rooms || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  room-events:
+    build: { context: ../.., dockerfile: infra/docker/room-events.Dockerfile }
+    environment:
+      PORT: 3003
+      WEB_INTERNAL_URL: http://web:3000
+    ports: ["3003:3003"]
+    depends_on:
+      web: { condition: service_healthy }
+
+  prometheus:
+    image: prom/prometheus:v2.53-alpine
+    volumes:
+      - ../observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+
+volumes:
+  pgdata:
