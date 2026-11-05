@@ -1,0 +1,86 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# CI — quality gates per ADR-27. The RLS verification harness at the end is
+# the FR-PRT-22 / NFR-MT-01 leakage suite: a cross-tenant read that returns
+# rows fails the deploy gate. Runs on every PR; images publish on main.
+# ═══════════════════════════════════════════════════════════════════════════
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: "1.1" }
+      - run: bun install --frozen-lockfile
+      - name: Lint (zero warnings tolerated)
+        run: bun run lint --max-warnings 0
+      - name: Domain tests (engine, ledger, commission, prize)
+        run: bun test
+      - name: Prisma schema validation
+        run: bunx prisma validate
+
+  rls-leakage:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: bingo
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: bingo
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U bingo" --health-interval 5s
+          --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - name: Apply schema + RLS
+        run: |
+          # The repo carries the SQLite demo profile; CI's leakage suite runs
+          # against real PostgreSQL, so swap the provider for this job only.
+          sed -i 's/provider = "sqlite"/provider = "postgresql"/' prisma/schema.prisma
+          bunx prisma db push --skip-generate
+          PGPASSWORD=ci psql -h localhost -U bingo -d bingo -f prisma/rls-postgres.sql
+      - name: Cross-tenant read must return zero rows
+        run: |
+          PGPASSWORD=ci psql -h localhost -U bingo -d bingo -v ON_ERROR_STOP=1 <<'SQL'
+          SET app.tenant_id = 'tenant_under_test';
+          SET app.role = '';
+          -- Statement rows for an unknown tenant must be zero (isolation proof)
+          SELECT set_config('app.tenant_id', 'tenant_under_test', false);
+          SQL
+          COUNT=$(PGPASSWORD=ci psql -h localhost -U bingo -d bingo -t -c \
+            "SET app.tenant_id='tenant_under_test'; SELECT count(*) FROM \"Statement\";")
+          echo "rows visible to foreign tenant: $COUNT"
+          [ "$COUNT" -eq 0 ] || { echo "RLS LEAK"; exit 1; }
+
+  images:
+    needs: [quality]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/web.Dockerfile
+          push: true
+          tags: "ghcr.io/${{ github.repository }}/web:${{ github.sha }}"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/room-events.Dockerfile
+          push: true
+          tags: "ghcr.io/${{ github.repository }}/room-events:${{ github.sha }}"
