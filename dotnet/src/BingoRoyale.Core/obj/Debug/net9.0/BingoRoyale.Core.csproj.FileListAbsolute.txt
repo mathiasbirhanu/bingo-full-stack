@@ -1,0 +1,11 @@
+C:\Users\Administrator\Desktop\Bingo-full-stack\dotnet\src\BingoRoyale.Core\obj\Debug\net9.0\BingoRoyale.Core.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Administrator\Desktop\Bingo-full-stack\dotnet\src\BingoRoyale.Core\obj\Debug\net9.0\BingoRoyale.Core.AssemblyInfoInputs.cache
+C:\Users\Administrator\Desktop\Bingo-full-stack\dotnet\src\BingoRoyale.Core\obj\Debug\net9.0\BingoRoyale.Core.AssemblyInfo.cs
+C:\Users\Administrator\Desktop\Bingo-full-stack\dotnet\src\BingoRoyale.Core\obj\Debug\net9.0\BingoRoyale.Core.csproj.CoreCompileInputs.cache
+C:\Users\Administrator\Desktop\Bingo-full-stack\dotnet\src\BingoRoyale.Core\bin\Debug\net9.0\BingoRoyale.Core.deps.json
+C:\Users\Administrator\Desktop\Bingo-full-stack\dotnet\src\BingoRoyale.Core\bin\Debug\net9.0\BingoRoyale.Core.dll
+C:\Users\Administrator\Desktop\Bingo-full-stack\dotnet\src\BingoRoyale.Core\bin\Debug\net9.0\BingoRoyale.Core.pdb
+C:\Users\Administrator\Desktop\Bingo-full-stack\dotnet\src\BingoRoyale.Core\obj\Debug\net9.0\BingoRoyale.Core.dll
+C:\Users\Administrator\Desktop\Bingo-full-stack\dotnet\src\BingoRoyale.Core\obj\Debug\net9.0\refint\BingoRoyale.Core.dll
+C:\Users\Administrator\Desktop\Bingo-full-stack\dotnet\src\BingoRoyale.Core\obj\Debug\net9.0\BingoRoyale.Core.pdb
+C:\Users\Administrator\Desktop\Bingo-full-stack\dotnet\src\BingoRoyale.Core\obj\Debug\net9.0\ref\BingoRoyale.Core.dll
