@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Windows 10 builds without KB5044273 abort .NET 9 processes at launch
+         with "Your Windows doesn't fully support CET" (dotnet/runtime#110920).
+         Microsoft's documented opt-out — harmless on Linux/Windows 11. -->
+    <CETCompat>false</CETCompat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="9.0.0" />
+    <!-- Architecture v5.0 ADR-03: PostgreSQL 16 is the sole system of record -->
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="9.0.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BingoRoyale.Core\BingoRoyale.Core.csproj" />
+  </ItemGroup>
+
+</Project>
