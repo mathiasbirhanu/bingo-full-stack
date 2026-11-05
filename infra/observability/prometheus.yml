@@ -1,0 +1,28 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Prometheus scrape config (ADR-29). In Kubernetes, kube-prometheus-stack
+# discovers pods via annotations; this file serves the compose/dev profile.
+#
+# Domain SLOs wired to alert rules (see docs/REVIEW_GUIDE.md §6):
+#   · outbox_dispatch_age_seconds  p95 > 5s  → page (SRS §11.4)
+#   · ball_call_latency_ms         p99 > 50ms → PERF-01 breach
+#   · room_event_seq_gaps_total    > 0       → fan-out integrity
+# ═══════════════════════════════════════════════════════════════════════════
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: bingo-web
+    metrics_path: /api/v1/metrics
+    static_configs:
+      - targets: ["web:3000"]
+
+  - job_name: room-events
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["room-events:3003"]
+
+  - job_name: nats
+    metrics_path: /jsz   # JetStream z-view: pending + redeliveries per stream
+    static_configs:
+      - targets: ["nats:8222"]
