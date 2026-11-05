@@ -1,0 +1,12 @@
+{
+  "name": "room-events-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Outbox relay + room event fan-out (ADR-19): reads published OutboxEvent rows from the system of record and pushes them to subscribed room sockets.",
+  "scripts": {
+    "dev": "bun --hot index.ts"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.1"
+  }
+}
