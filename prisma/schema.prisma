@@ -1,0 +1,592 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Bingo Real-Money Platform — Build 1 (demo-phase reference implementation)
+//
+// Traceability: SRS v5.0 (UC-01..15, FR-*), Architecture Specification v5.0
+// (ADR-01..26), Implementation & Delivery Plan v1.0 (S1 tenant-ready contract).
+//
+// Conventions (normative for all modules):
+//  · Money is int64 santim (ETB minor unit) — BigInt columns, never float.
+//  · Every business entity carries tenantId (nullable = platform-owned) —
+//    ADR-24 "tenant-ready from birth". Production PostgreSQL adds row-level
+//    security on these columns (see prisma/rls-postgres.sql); application-level
+//    scoping is the primary boundary in this build.
+//  · Portable schema: union values are documented strings, JSON payloads are
+//    TEXT parsed by typed helpers in src/lib/json.ts (works identically on
+//    PostgreSQL — the datasource provider is `postgresql`).
+//  · Ledger, audit and KYB reviews are append-only: the application layer
+//    never UPDATEs or DELETEs rows in those tables.
+// ─────────────────────────────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Tenancy (FR-PRT, UC-11/14) ───────────────────────────────────────────────
+
+/// Tenant lifecycle: REGISTERED → UNDER_REVIEW → (INFO_REQUESTED →)*
+/// UNDER_REVIEW → APPROVED | REJECTED; APPROVED ⇄ SUSPENDED.
+/// Privileges exist only in APPROVED state (UC-11 postcondition).
+model Tenant {
+  id              String   @id @default(cuid())
+  code            String   @unique // short human code, e.g. "SHEGER"
+  legalName       String
+  tin             String // tax identification number
+  jurisdiction    String
+  contactEmail    String
+  contactPhone    String
+  status          String   @default("REGISTERED")
+  statusReason    String? // mandatory reason code on suspension (UC-14)
+  beneficialOwners String  @default("[]") // JSON: [{name, idType, idRef, sharePct}]
+  documentSetHash String? // SHA-256 over ordered KYB checksums (FR-PRT-04)
+  approvedAt      DateTime?
+  suspendedAt     DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  documents      KybDocument[]
+  reviews        KybReview[]
+  commissionPlans CommissionPlan[]
+  dailyAccruals  DailyAccrual[]
+  statements     Statement[]
+  payoutRequests PayoutRequest[]
+  configEntities ConfigEntity[]
+  users          User[]
+  rooms          Room[]
+
+  @@index([status])
+}
+
+/// Encrypted document vault entry (UC-11). Bytes live on disk under db/vault/,
+/// AES-256-GCM at rest; row keeps type, version and SHA-256 checksum.
+model KybDocument {
+  id           String   @id @default(cuid())
+  tenantId     String
+  tenant       Tenant   @relation(fields: [tenantId], references: [id])
+  type         String // CHECKLIST value, e.g. TIN_CERTIFICATE, ARTICLES, ID_BENEFICIAL_OWNER
+  version      Int      @default(1)
+  fileName     String
+  mime         String
+  sizeBytes    Int
+  sha256       String // plaintext-file checksum, shown in review UI
+  storagePath  String // vault path (encrypted bytes)
+  uploadedById String
+  createdAt    DateTime @default(now())
+
+  @@index([tenantId, type])
+}
+
+/// Append-only KYB review decisions (maker-checker: FR-PRT-04).
+model KybReview {
+  id              String   @id @default(cuid())
+  tenantId        String
+  tenant          Tenant   @relation(fields: [tenantId], references: [id])
+  officerId       String
+  decision        String // INFO_REQUESTED | REJECTED | APPROVED
+  note            String
+  documentSetHash String? // approval binds to the reviewed dossier hash
+  createdAt       DateTime @default(now())
+
+  @@index([tenantId])
+}
+
+// ── Identity & access (UC-01, FR-SEC) ────────────────────────────────────────
+
+/// Roles: PLAYER, ADMIN, SUPERVISOR, SUPPORT, AUDITOR,
+///        TENANT_OWNER, TENANT_SUPERVISOR, PLATFORM_COMPLIANCE, PLATFORM_FINANCE.
+/// tenantId is set for tenant-side and null for platform-side roles.
+/// Phone stored AES-256-GCM encrypted + HMAC blind index for lookup (FR-SEC-01).
+model User {
+  id             String    @id @default(cuid())
+  phoneE164      String // encrypted envelope
+  phoneBlindIdx  String    @unique
+  displayName    String?
+  role           String    @default("PLAYER")
+  tenantId       String?
+  tenant         Tenant?   @relation(fields: [tenantId], references: [id])
+  status         String    @default("ACTIVE") // ACTIVE | BLOCKED
+  statusReason   String?
+  locale         String    @default("en")
+  createdAt      DateTime  @default(now())
+  lastLoginAt    DateTime?
+
+  sessions       Session[]
+  tickets        Ticket[]
+  purchases      Purchase[]
+  claims         Claim[]
+  walletAccount  LedgerAccount? @relation("WalletOwner")
+
+  @@index([tenantId])
+}
+
+model OtpCode {
+  id        String    @id @default(cuid())
+  phoneIdx  String // blind index, never the raw number
+  codeHash  String // sha256(code + salt)
+  expiresAt DateTime
+  attempts  Int       @default(0)
+  consumedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([phoneIdx, createdAt])
+}
+
+/// Rotating refresh tokens stored hashed (UC-01: 14 days, hashed at rest).
+model Session {
+  id         String    @id @default(cuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id])
+  refreshHash String   @unique
+  userAgent  String?
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// ── Ledger (FR-FIN) — append-only double-entry ──────────────────────────────
+
+/// Account codes: PLAYER_WALLET:{userId}, ROUND_ESCROW:{roundId},
+/// PAYMENT_CLEARING:DEMO, PAYOUT_CLEARING:DEMO, EXTERNAL_FUNDING,
+/// HOUSE_REVENUE, PLATFORM_COMMISSION:{tenantId} (expense),
+/// PARTNER_PAYABLE:{tenantId} (liability).
+/// type: ASSET | LIABILITY | EQUITY | REVENUE | EXPENSE.
+/// Debit raises ASSET/EXPENSE; credit raises LIABILITY/REVENUE/EQUITY.
+model LedgerAccount {
+  id            String  @id @default(cuid())
+  code          String  @unique
+  type          String
+  tenantId      String?
+  ownerUserId   String?  @unique
+  ownerUser     User?   @relation("WalletOwner", fields: [ownerUserId], references: [id])
+  displayName   String
+  createdAt     DateTime @default(now())
+
+  entries       JournalEntry[]
+  balance       WalletBalance?
+
+  @@index([tenantId])
+}
+
+/// Balanced by invariant sum(DEBIT)==sum(CREDIT) per transaction, enforced in
+/// src/modules/ledger and re-verified nightly (UC-10 reconciliation).
+model JournalTransaction {
+  id             String   @id @default(cuid())
+  kind           String // DEPOSIT | PURCHASE | PRIZE | REFUND | PRIZE_ADJUSTMENT | COMMISSION_ACCRUAL | PARTNER_PAYOUT | ROUND_RESIDUAL | ADJUSTMENT
+  idempotencyKey String   @unique // saga safety: one tx per key, ever (UC-02/03/09/15)
+  roundId        String?
+  tenantId       String?
+  memo           String
+  demo           Boolean  @default(true) // every demo artifact carries the DEMO flag
+  createdAt      DateTime @default(now())
+
+  entries        JournalEntry[]
+
+  @@index([roundId])
+  @@index([tenantId, kind])
+}
+
+model JournalEntry {
+  id             String             @id @default(cuid())
+  transactionId  String
+  transaction    JournalTransaction @relation(fields: [transactionId], references: [id])
+  accountId      String
+  account        LedgerAccount      @relation(fields: [accountId], references: [id])
+  direction      String // DEBIT | CREDIT
+  amountSantim   BigInt
+  seq            Int
+
+  @@index([accountId])
+}
+
+/// Projection beside the journals (ADR-04: no monetary state outside the
+/// system of record). Rebuilt by reconciliation if variance is detected.
+model WalletBalance {
+  accountId      String         @id
+  account        LedgerAccount  @relation(fields: [accountId], references: [id])
+  balanceSantim  BigInt
+  updatedAt      DateTime       @updatedAt
+}
+
+// ── Game content — versioned configuration (UC-07/08/13, FR-ADM/FR-PRT) ─────
+
+/// Variants seeded at bootstrap: BALL_75, BALL_90 (FR-GAME-01; 80/30-ball
+/// refused while OD-05 remains open).
+model Variant {
+  id        String  @id // "BALL_75" | "BALL_90"
+  name      String
+  gridSpec  String // JSON: grid shape + column ranges + free squares
+  active    Boolean @default(true)
+}
+
+/// Generic versioned config entity: type ∈ PATTERN | ROOM_TEMPLATE | PRIZE_RULESET.
+/// Immutable once published; edits create a new version (UC-07).
+model ConfigEntity {
+  id            String   @id @default(cuid())
+  type          String
+  tenantId      String? // null = platform (house) content
+  tenant        Tenant?  @relation(fields: [tenantId], references: [id])
+  name          String
+  currentVersion Int     @default(0) // 0 = never published
+  locked        Boolean  @default(false) // locked while an active round pins it
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  versions      ConfigVersion[]
+  drafts        ConfigDraft[]
+
+  @@index([type, tenantId])
+}
+
+/// Published immutable version; payloadHash binds approval to content (UC-08).
+model ConfigVersion {
+  id           String   @id @default(cuid())
+  entityId     String
+  entity       ConfigEntity @relation(fields: [entityId], references: [id])
+  version      Int
+  payloadJson  String
+  payloadHash  String // sha256(canonicalJson(payload))
+  publishedAt  DateTime @default(now())
+  publishedById String
+  draftId      String?
+
+  @@unique([entityId, version])
+}
+
+/// Maker-checker draft (UC-08). Self-approval structurally rejected in
+/// publishDraft(); stale payload (hash mismatch) refuses approval.
+/// status: DRAFT | PENDING | APPROVED | REJECTED | PUBLISHED.
+model ConfigDraft {
+  id           String    @id @default(cuid())
+  entityId     String? // null → publishes as a new entity
+  entity       ConfigEntity? @relation(fields: [entityId], references: [id])
+  type         String
+  tenantId     String?
+  title        String
+  payloadJson  String
+  payloadHash  String
+  status       String    @default("DRAFT")
+  makerId      String
+  checkerId    String?
+  rejectReason String?
+  submittedAt  DateTime?
+  decidedAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([tenantId, status])
+  @@index([status])
+}
+
+// ── Rooms & rounds (UC-03/04, FR-ROOM, FR-GAME) ─────────────────────────────
+
+/// A scheduled round instance. Pinned config versions never change mid-round
+/// (FR-ROOM-02). Lifecycle: SCHEDULED → SALES_OPEN → LOCKED → DRAWING →
+/// RESOLVING → COMPLETED | VOIDED.
+model Room {
+  id               String    @id @default(cuid())
+  tenantId         String? // null = house room
+  tenant           Tenant?   @relation(fields: [tenantId], references: [id])
+  title            String
+  templateVersionId String // pinned RoomTemplate ConfigVersion
+  rulesetVersionId String // pinned PrizeRuleset ConfigVersion
+  patternVersionIds String   @default("[]") // JSON: pattern ConfigVersion ids pinned
+  variantId        String
+  status           String    @default("SCHEDULED")
+  priceSantim      BigInt
+  maxCardsPerPlayer Int      @default(6) // MVP constant (FR-PLY-03)
+  ballIntervalMs   Int       @default(4000) // default 4 s (OD-04)
+  autoClaim        Boolean   @default(true) // auto-claim convenience flag (UC-04)
+  scheduledAt      DateTime
+  salesOpenAt      DateTime
+  salesCloseAt     DateTime
+  grossSantim      BigInt    @default(0) // confirmed sales totals (report input)
+  netPoolSantim    BigInt    @default(0)
+  committedAt      DateTime?
+  completedAt      DateTime?
+  voidedAt         DateTime?
+  voidReason       String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  tickets    Ticket[]
+  balls      BallDraw[]
+  claims     Claim[]
+  purchases  Purchase[]
+  seal       FairnessSeal?
+  report     RoundReport?
+
+  @@index([status, salesOpenAt])
+  @@index([tenantId])
+}
+
+/// Drawn balls, per-room sequence numbers (UC-04 BALL_CALLED events).
+model BallDraw {
+  id       String   @id @default(cuid())
+  roomId   String
+  room     Room     @relation(fields: [roomId], references: [id])
+  seq      Int
+  ball     Int
+  calledAt DateTime @default(now())
+
+  @@unique([roomId, seq])
+  @@unique([roomId, ball])
+}
+
+/// Commit-reveal fairness envelope (UC-06, FR-GAME-04/07). Seed revealed only
+/// on completion; verification recomputes the draw from published values.
+model FairnessSeal {
+  id             String    @id @default(cuid())
+  roomId         String    @unique
+  room           Room      @relation(fields: [roomId], references: [id])
+  commitment     String // sha256(serverSeed || salt)
+  clientSeedContribution String // sha256(sorted ticket ids) at lock
+  nonce          Int       @default(0)
+  serverSeedEnc  String // sealed until reveal (AES-GCM)
+  salt           String // revealed
+  revealedSeed   String? // revealed at completion
+  revealedAt     DateTime?
+  inputHash      String // sha256 over prize inputs at resolution
+  createdAt      DateTime  @default(now())
+}
+
+/// One bingo card. numbersJson holds the variant grid; fingerprint is the
+/// uniqueness guarantee per round (FR-GAME-02/03).
+model Ticket {
+  id          String   @id @default(cuid())
+  roomId      String
+  room        Room     @relation(fields: [roomId], references: [id])
+  playerId    String
+  player      User     @relation(fields: [playerId], references: [id])
+  tenantId    String?
+  numbersJson String
+  fingerprint String // sha256 over canonical card numbers
+  createdAt   DateTime @default(now())
+
+  @@unique([roomId, fingerprint])
+  @@index([playerId, roomId])
+}
+
+/// Purchase saga result (UC-03). Idempotent by client key: a retry with the
+/// same key replays the stored result and never double-debits.
+model Purchase {
+  id              String   @id @default(cuid())
+  idempotencyKey  String   @unique
+  roomId          String
+  room            Room     @relation(fields: [roomId], references: [id])
+  playerId        String
+  player          User     @relation(fields: [playerId], references: [id])
+  quantity        Int
+  totalSantim     BigInt
+  journalTxId     String
+  status          String   @default("CONFIRMED") // CONFIRMED | REFUNDED
+  createdAt       DateTime @default(now())
+
+  @@index([playerId, roomId])
+}
+
+/// Claim lifecycle (UC-04, FR-CLM). Rejections are recorded, never deleted.
+/// status: PENDING | CONFIRMED | REJECTED.
+model Claim {
+  id                String    @id @default(cuid())
+  clientClaimId     String    @unique // client-supplied, safe resend (UC-04)
+  roomId            String
+  room              Room      @relation(fields: [roomId], references: [id])
+  ticketId          String
+  playerId          String
+  player            User      @relation(fields: [playerId], references: [id])
+  patternVersionId  String
+  ballSeq           Int // sequence at which the claim arrived
+  status            String    @default("PENDING")
+  reasonCode        String? // BALL_NOT_CALLED | PATTERN_ALREADY_CONFIRMED | NOT_COMPLETE | SALES_CLOSED
+  awardSantim       BigInt?
+  journalTxId       String?
+  decidedAt         DateTime?
+  createdAt         DateTime  @default(now())
+
+  @@index([roomId, status])
+  @@index([playerId])
+}
+
+// ── Payments (UC-02, FR-PAY) ────────────────────────────────────────────────
+
+/// Payment-port intent. PAYMENT_MODE=DEMO routes to the demo adapter only;
+/// the mode guard refuses any real rail (FR-PAY-04). Repeated intent with a
+/// different payload → IDEMPOTENCY_CONFLICT (payload hash check).
+model DepositIntent {
+  id             String    @id @default(cuid())
+  idempotencyKey String    @unique
+  userId         String
+  amountSantim   BigInt
+  payloadHash    String
+  status         String    @default("PENDING") // PENDING | CONFIRMED | FAILED
+  providerRef    String?
+  journalTxId    String?
+  createdAt      DateTime  @default(now())
+  confirmedAt    DateTime?
+
+  @@index([userId])
+}
+
+// ── Events (transactional outbox, ADR-03) ───────────────────────────────────
+
+/// Written inside the same transaction as the state change; relayed by
+/// the game-gateway relay and the finance worker. At-least-once, dedupe by id.
+model OutboxEvent {
+  id           Int       @id @default(autoincrement())
+  type         String // TICKET_CONFIRMED | ROOM_PHASE | AWARDS_RESOLVED | ROUND_COMPLETED | ROUND_VOIDED | COMMISSION_ACCRUED | ...
+  aggregateId  String // room/tenant id
+  payloadJson  String
+  createdAt    DateTime  @default(now())
+  publishedAt  DateTime?
+  consumer     String? // gateway | finance (ack marker)
+
+  @@index([consumer, id])
+  @@index([type, aggregateId])
+}
+
+// ── Audit (append-only) ─────────────────────────────────────────────────────
+
+/// Written on every state-machine transition. Never updated, never deleted —
+/// there is no code path that does (UC-10/FR-SEC, ADR-05 audit posture).
+model AuditRecord {
+  id          Int      @id @default(autoincrement())
+  actorId     String?
+  actorRole   String?
+  tenantId    String?
+  action      String // e.g. OTP_LOGIN, PURCHASE_CONFIRMED, DRAFT_PUBLISHED, TENANT_SUSPENDED
+  entityType  String
+  entityId    String
+  payloadHash String?
+  metaJson    String?
+  at          DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([tenantId])
+}
+
+// ── Reporting (UC-10) ───────────────────────────────────────────────────────
+
+/// Auto-generated at round completion; JSON report per FR-ADM-08.
+model RoundReport {
+  id         String   @id @default(cuid())
+  roomId     String   @unique
+  room       Room     @relation(fields: [roomId], references: [id])
+  payloadJson String
+  createdAt  DateTime @default(now())
+}
+
+/// Nightly (and on-demand) reconciliation result; any variance is Severity 1.
+model ReconReport {
+  id          String   @id @default(cuid())
+  day         String // YYYY-MM-DD
+  payloadJson String // per-account checks with variance detail
+  varianceCount Int    @default(0)
+  status      String   @default("OK") // OK | VARIANCE
+  createdAt   DateTime @default(now())
+
+  @@index([day])
+}
+
+// ── Commission & settlement (UC-12/15, FR-PRT-07..19) ──────────────────────
+
+/// Versioned commission plan. Basis TURNOVER for MVP (D-PRT-02); rate in bps
+/// validated against market bounds (OD-12). Plans never overlap: a new plan's
+/// effectiveFrom must be strictly after the last plan's effectiveFrom.
+model CommissionPlan {
+  id            String   @id @default(cuid())
+  tenantId      String
+  tenant        Tenant   @relation(fields: [tenantId], references: [id])
+  basis         String   @default("TURNOVER")
+  rateBps       Int // basis points, floor(turnover × rateBps / 10000)
+  effectiveFrom DateTime
+  payloadHash   String
+  draftId       String? // maker-checker provenance
+  approvedById  String
+  createdAt     DateTime @default(now())
+
+  @@index([tenantId, effectiveFrom])
+}
+
+/// Idempotent per tenant-day (UC-15). commission = floor(turnover × bps / 10000)
+/// computed in bigint arithmetic in src/modules/commission/accrual.ts.
+model DailyAccrual {
+  id               String   @id @default(cuid())
+  tenantId         String
+  tenant           Tenant   @relation(fields: [tenantId], references: [id])
+  day              String // YYYY-MM-DD (Africa/Addis_Ababa)
+  turnoverSantim   BigInt
+  rateBps          Int
+  planId           String
+  commissionSantim BigInt
+  journalTxId      String
+  computedAt       DateTime @default(now())
+
+  @@unique([tenantId, day])
+}
+
+/// Immutable monthly statement (FR-PRT-17). Totals equal the sum of daily
+/// accruals for the period; content hash binds confirmation and disputes.
+model Statement {
+  id                String    @id @default(cuid())
+  tenantId          String
+  tenant            Tenant    @relation(fields: [tenantId], references: [id])
+  periodMonth       String // YYYY-MM
+  turnoverSantim    BigInt
+  prizesSantim      BigInt
+  commissionSantim  BigInt
+  payableSantim     BigInt
+  residualSantim    BigInt
+  adjustmentsSantim BigInt    @default(0)
+  contentHash       String
+  status            String    @default("ISSUED") // ISSUED | CONFIRMED | DISPUTED
+  issuedAt          DateTime  @default(now())
+  confirmedAt       DateTime?
+
+  disputes          StatementDispute[]
+  payoutRequests    PayoutRequest[]
+
+  @@unique([tenantId, periodMonth])
+}
+
+/// Append-only dispute chain (UC-15 failure flows).
+model StatementDispute {
+  id           String    @id @default(cuid())
+  statementId  String
+  statement    Statement @relation(fields: [statementId], references: [id])
+  reasonCode   String
+  note         String
+  raisedById   String
+  reviewerNote String?
+  resolvedAt   DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([statementId])
+}
+
+/// Payout requires a CONFIRMED statement (refused otherwise); approved through
+/// finance maker-checker; demo settles through the demo clearing path only
+/// (DEMO_PAYOUT_BLOCKED for anything else). status: REQUESTED | APPROVED |
+/// REJECTED | SETTLED | REFUSED.
+model PayoutRequest {
+  id            String    @id @default(cuid())
+  statementId   String
+  statement     Statement @relation(fields: [statementId], references: [id])
+  tenantId      String
+  tenant        Tenant    @relation(fields: [tenantId], references: [id])
+  amountSantim  BigInt
+  status        String    @default("REQUESTED")
+  requestedById String
+  decidedById   String?
+  decisionNote  String?
+  journalTxId   String?
+  requestedAt   DateTime  @default(now())
+  decidedAt     DateTime?
+  settledAt     DateTime?
+
+  @@index([tenantId, status])
+}
