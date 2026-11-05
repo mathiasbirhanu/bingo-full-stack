@@ -1,0 +1,11 @@
+{
+  // Pin the SDK to the .NET 9 band the architecture documents mandate.
+  // Without this, `dotnet` picks the highest installed SDK (e.g. 10.x), whose
+  // Roslyn aborts on Windows 10 with "Your Windows doesn't fully support CET"
+  // (dotnet/runtime#110920). rollForward=latestFeature accepts any 9.0.x SDK.
+  "sdk": {
+    "version": "9.0.100",
+    "rollForward": "latestFeature",
+    "allowPrerelease": false
+  }
+}
